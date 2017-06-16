@@ -193,9 +193,6 @@ extern char *opt_server_public_key;
 #endif
 
 
-void
-xtrabackup_backup_func(void);
-
 my_bool
 xb_get_one_option(int optid,
 		  const struct my_option *opt __attribute__((unused)),

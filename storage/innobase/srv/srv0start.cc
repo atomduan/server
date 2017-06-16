@@ -2774,6 +2774,7 @@ innodb_shutdown()
 
 	switch (srv_operation) {
 	case SRV_OPERATION_BACKUP:
+		fil_close_all_files();
 		break;
 	case SRV_OPERATION_NORMAL:
 	case SRV_OPERATION_RESTORE:
@@ -2785,10 +2786,10 @@ innodb_shutdown()
 				   << n_threads << " queries still"
 				" inside InnoDB at shutdown";
 		}
-
-		/* Exit any remaining threads. */
-		srv_shutdown_all_bg_threads();
 	}
+
+	/* Exit any remaining threads. */
+	srv_shutdown_all_bg_threads();
 
 	if (srv_monitor_file) {
 		fclose(srv_monitor_file);
