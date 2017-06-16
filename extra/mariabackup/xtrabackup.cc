@@ -2325,51 +2325,29 @@ skip:
 	return(FALSE);
 }
 
-/*******************************************************//**
-Scans log from a buffer and writes new log data to the outpud datasinc.
-@return true if success */
+/** Copy redo log blocks to the data sink.
+@param[in]	is_last		whether this is the last log segment to copy
+@param[in]	start_lsn	buffer start LSN
+@param[in]	end_lsn		buffer end LSN
+@return	last copied LSN
+@retval	0	on failure */
 static
-bool
-xtrabackup_scan_log_recs(
-/*===============*/
-	log_group_t*	group,		/*!< in: log group */
-	bool		is_last,	/*!< in: whether it is last segment
-					to copy */
-	lsn_t		start_lsn,	/*!< in: buffer start lsn */
-	lsn_t*		contiguous_lsn,	/*!< in/out: it is known that all log
-					groups contain contiguous log data up
-					to this lsn */
-	lsn_t*		group_scanned_lsn,/*!< out: scanning succeeded up to
-					this lsn */
-	bool*		finished)	/*!< out: false if is not able to scan
-					any more in this log group */
+lsn_t
+xtrabackup_copy_log(bool is_last, lsn_t start_lsn, lsn_t end_lsn)
 {
-	lsn_t		scanned_lsn;
-	ulint		data_len;
-	ulint		write_size;
-	const byte*	log_block;
+	lsn_t	scanned_lsn	= start_lsn;
 
-	ulint		scanned_checkpoint_no = 0;
+	const ulint blocks_in_group = log_block_convert_lsn_to_no(
+		log_sys->log.capacity()) - 1;
+	const byte* log_block = log_sys->buf;
 
-	*finished = false;
-	scanned_lsn = start_lsn;
-	log_block = log_sys->buf;
-
-	while (log_block < log_sys->buf + RECV_SCAN_SIZE && !*finished) {
+	for (ulint scanned_checkpoint = 0;
+	     scanned_lsn < end_lsn;
+	     log_block += OS_FILE_LOG_BLOCK_SIZE) {
 		ulint	no = log_block_get_hdr_no(log_block);
 		ulint	scanned_no = log_block_convert_lsn_to_no(scanned_lsn);
-		ulint	cksum = log_block_get_checksum(log_block);
-		bool	check = innodb_log_checksums
-			|| log_sys->log.is_encrypted();
-		ulint	crc = check
-			? log_block_calc_checksum_crc32(log_block) : 0;
 
-		if (no != scanned_no && (!check || crc == cksum)) {
-			ulint blocks_in_group;
-
-			blocks_in_group = log_block_convert_lsn_to_no(
-				group->capacity()) - 1;
-
+		if (no != scanned_no) {
 			if ((no < scanned_no &&
 			    ((scanned_no - no) % blocks_in_group) == 0) ||
 			    no == 0 ||
@@ -2378,15 +2356,15 @@ xtrabackup_scan_log_recs(
 			    blocks_in_group == 0) {
 
 				/* old log block, do nothing */
-				*finished = true;
 				break;
 			}
 
 			msg("xtrabackup: error:"
 			    " log block numbers mismatch:\n"
-			    "xtrabackup: error: expected log block no. %lu,"
-			    " but got no. %lu from the log file.\n",
-			    (ulong) scanned_no, (ulong) no);
+			    "xtrabackup: error: expected log block no. "
+			    ULINTPF ", but got no. " ULINTPF
+			    " from the log file.\n",
+			    scanned_no, no);
 
 			if ((no - scanned_no) % blocks_in_group == 0) {
 				msg("xtrabackup: error:"
@@ -2397,116 +2375,64 @@ xtrabackup_scan_log_recs(
 				    " log files being too small.\n");
 			}
 
-			return(false);
-		} else if (check && crc != cksum) {
-			/* Garbage or an incompletely written log block */
-
-			msg("xtrabackup: warning: Log block checksum mismatch"
-			    " (block no " ULINTPF " at lsn " LSN_PF "): \n"
-			    "expected " ULINTPFx ", calculated " ULINTPFx "\n",
-			    no, scanned_lsn, cksum, crc);
-			msg("xtrabackup: warning: this is possible when the "
-			    "log block has not been fully written by the "
-			    "server, will retry later.\n");
-			*finished = true;
-			break;
+			return(0);
 		}
 
-		if (log_block_get_flush_bit(log_block)) {
-			/* This block was a start of a log flush operation:
-			we know that the previous flush operation must have
-			been completed for all log groups before this block
-			can have been flushed to any of the groups. Therefore,
-			we know that log data is contiguous up to scanned_lsn
-			in all non-corrupt log groups. */
+		ulint checkpoint = log_block_get_checkpoint_no(log_block);
 
-			if (scanned_lsn > *contiguous_lsn) {
-
-				*contiguous_lsn = scanned_lsn;
-			}
-		}
-
-		data_len = log_block_get_data_len(log_block);
-
-		if (
-		    (scanned_checkpoint_no > 0)
-		    && (log_block_get_checkpoint_no(log_block)
-		       < scanned_checkpoint_no)
-		    && (scanned_checkpoint_no
-			- log_block_get_checkpoint_no(log_block)
-			> 0x80000000UL)) {
-
+		if (scanned_checkpoint > checkpoint
+		    && scanned_checkpoint - checkpoint >= 0x80000000UL) {
 			/* Garbage from a log buffer flush which was made
 			before the most recent database recovery */
-
-			*finished = true;
 			break;
 		}
 
-		scanned_lsn = scanned_lsn + data_len;
-		scanned_checkpoint_no = log_block_get_checkpoint_no(log_block);
+		scanned_checkpoint = checkpoint;
+		ulint	data_len = log_block_get_data_len(log_block);
+		scanned_lsn += data_len;
 
-		if (data_len < OS_FILE_LOG_BLOCK_SIZE) {
-			/* Log data for this group ends here */
-
-			*finished = true;
-		} else {
-			log_block += OS_FILE_LOG_BLOCK_SIZE;
+		if (data_len != OS_FILE_LOG_BLOCK_SIZE) {
+			break;
 		}
 	}
-
-	*group_scanned_lsn = scanned_lsn;
 
 	/* ===== write log to 'xtrabackup_logfile' ====== */
-	if (!*finished) {
-		write_size = RECV_SCAN_SIZE;
-		ut_ad(!is_last);
-	} else {
-		write_size = (ulint)(ut_uint64_align_up(scanned_lsn,
-					OS_FILE_LOG_BLOCK_SIZE) - start_lsn);
-		if (!is_last && scanned_lsn % OS_FILE_LOG_BLOCK_SIZE) {
-			write_size -= OS_FILE_LOG_BLOCK_SIZE;
+	if (!is_last && scanned_lsn & (OS_FILE_LOG_BLOCK_SIZE - 1)) {
+		/* Omit the partial last block. */
+		scanned_lsn &= ~(OS_FILE_LOG_BLOCK_SIZE - 1);
+	}
+
+	log_sys->log.scanned_lsn = scanned_lsn;
+
+	if (ulint write_size = ulint(ut_uint64_align_up(scanned_lsn,
+							OS_FILE_LOG_BLOCK_SIZE)
+				     - start_lsn)) {
+		if (srv_encrypt_log) {
+			log_crypt(log_sys->buf, write_size);
+		}
+
+		if (ds_write(dst_log_file, log_sys->buf, write_size)) {
+			msg("xtrabackup: Error: "
+			    "write to logfile failed\n");
+			return(0);
 		}
 	}
 
-	if (write_size == 0) {
-		return(true);
-	}
-
-	if (srv_encrypt_log) {
-		log_crypt(log_sys->buf, write_size);
-	}
-
-	if (ds_write(dst_log_file, log_sys->buf, write_size)) {
-		msg("xtrabackup: Error: "
-		    "write to logfile failed\n");
-		return(false);
-	}
-
-	return(true);
+	return(scanned_lsn);
 }
 
 static my_bool
-xtrabackup_copy_logfile(lsn_t from_lsn, my_bool is_last)
+xtrabackup_copy_logfile(lsn_t from_lsn, bool is_last)
 {
-	/* definition from recv_recovery_from_checkpoint_start() */
-	lsn_t		contiguous_lsn;
-
 	ut_a(dst_log_file != NULL);
 	ut_ad(recv_sys != NULL);
 
-	/* read from checkpoint_lsn_start to current */
-	contiguous_lsn = ut_uint64_align_down(from_lsn, OS_FILE_LOG_BLOCK_SIZE);
-
-	/* TODO: We must check the contiguous_lsn still exists in log file.. */
-
-	bool	finished;
 	lsn_t	start_lsn;
 	lsn_t	end_lsn;
 
 	/* reference recv_group_scan_log_recs() */
 
-	start_lsn = contiguous_lsn;
+	start_lsn = ut_uint64_align_down(from_lsn, OS_FILE_LOG_BLOCK_SIZE);
 
 	do {
 		end_lsn = start_lsn + RECV_SCAN_SIZE;
@@ -2515,32 +2441,27 @@ xtrabackup_copy_logfile(lsn_t from_lsn, my_bool is_last)
 
 		log_mutex_enter();
 
-		log_group_read_log_seg(log_sys->buf,
-				       &log_sys->log, start_lsn, end_lsn);
+		end_lsn = log_group_read_log_seg(log_sys->buf, &log_sys->log,
+						 start_lsn, end_lsn);
 
-		bool success = xtrabackup_scan_log_recs(
-			&log_sys->log, is_last,
-			start_lsn, &contiguous_lsn,
-			&log_sys->log.scanned_lsn,
-			&finished);
+		start_lsn = xtrabackup_copy_log(is_last, start_lsn, end_lsn);
 
 		log_mutex_exit();
 
-		if (!success) {
+		if (!start_lsn) {
 			ds_close(dst_log_file);
 			msg("xtrabackup: Error: xtrabackup_copy_logfile()"
 			    " failed.\n");
 			return(TRUE);
 		}
+	} while (start_lsn == end_lsn);
 
-		start_lsn = end_lsn;
-	} while (!finished);
+	ut_ad(start_lsn == log_sys->log.scanned_lsn);
 
-	msg_ts(">> log scanned up to (" LSN_PF ")\n",
-	       log_sys->log.scanned_lsn);
+	msg_ts(">> log scanned up to (" LSN_PF ")\n", start_lsn);
 
 	/* update global variable*/
-	log_copy_scanned_lsn = log_sys->log.scanned_lsn;
+	log_copy_scanned_lsn = start_lsn;
 
 	debug_sync_point("xtrabackup_copy_logfile_pause");
 	return(FALSE);
