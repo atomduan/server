@@ -89,7 +89,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "xbstream.h"
 #include "changed_page_bitmap.h"
 #include "read_filt.h"
-#include "wsrep.h"
+#include "backup_wsrep.h"
 #include "innobackupex.h"
 #include "backup_mysql.h"
 #include "backup_copy.h"
@@ -99,6 +99,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <sql_plugin.h>
 #include <srv0srv.h>
 #include <crc_glue.h>
+#include <log.h>
+
 
 /* TODO: replace with appropriate macros used in InnoDB 5.6 */
 #define PAGE_ZIP_MIN_SIZE_SHIFT	10
@@ -303,6 +305,7 @@ std::set<std::string> param_set;
 static ulonglong global_max_value;
 
 extern "C" sig_handler handle_fatal_signal(int sig);
+extern LOGGER logger;
 
 my_bool opt_galera_info = FALSE;
 my_bool opt_slave_info = FALSE;
@@ -6058,6 +6061,10 @@ int main(int argc, char **argv)
 	system_charset_info = &my_charset_utf8_general_ci;
 	key_map_full.set_all();
 
+	logger.init_base();
+	logger.set_handlers(LOG_FILE, LOG_NONE, LOG_NONE);
+	mysql_mutex_init(key_LOCK_error_log, &LOCK_error_log, MY_MUTEX_INIT_FAST);
+
 	handle_options(argc, argv, &client_defaults, &server_defaults);
 
 	int argc_server;
@@ -6266,6 +6273,9 @@ int main(int argc, char **argv)
 
 	if (THR_THD)
 		(void) pthread_key_delete(THR_THD);
+
+	logger.cleanup_base();
+	mysql_mutex_destroy(&LOCK_error_log);
 
 	msg_ts("completed OK!\n");
 
